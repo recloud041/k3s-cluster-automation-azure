@@ -1,0 +1,116 @@
+name: Deploy Azure VMs and Install K3s
+
+on:
+  push:
+    branches:
+      - main  
+jobs:
+  deploy_k3s_cluster:
+    runs-on: ubuntu-spot-runner #This is my custom runner, you can change it to ubuntu-latest or any other runner
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Determine Terraform Action
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          echo "TF_ACTION=${{ github.event.inputs.action }}" >> $GITHUB_ENV
+        else
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          echo "Commit message: $COMMIT_MSG"
+          if [[ "$COMMIT_MSG" =~ terraform\ apply ]]; then
+            echo "TF_ACTION=apply" >> $GITHUB_ENV
+          elif [[ "$COMMIT_MSG" =~ terraform\ destroy ]]; then
+            echo "TF_ACTION=destroy" >> $GITHUB_ENV
+          elif [[ "$COMMIT_MSG" =~ terraform\ plan ]]; then
+            echo "TF_ACTION=plan" >> $GITHUB_ENV
+          else
+            echo "TF_ACTION=none" >> $GITHUB_ENV
+          fi
+        fi
+
+    - name: Terraform Init
+      if: env.TF_ACTION != 'none'
+      working-directory: terraform-az-k3s/
+      run: terraform init
+
+    - name: Terraform Plan
+      if: env.TF_ACTION == 'plan'
+      working-directory: terraform-az-k3s/
+      run: terraform plan
+
+    - name: Terraform Apply
+      if: env.TF_ACTION == 'apply'
+      working-directory: terraform-az-k3s/
+      run: terraform apply -auto-approve
+
+    - name: Terraform Destroy
+      if: env.TF_ACTION == 'destroy'
+      working-directory: terraform-az-k3s/
+      run: terraform destroy 
+
+    - name: Extract Master and Worker IPs
+      if: env.TF_ACTION == 'apply'
+      id: tf_output
+      working-directory: terraform-az-k3s/
+      run: |
+        echo "[DEBUG] Getting public IPs..."
+        IP_JSON=$(terraform output -json vm_public_ips)
+        MASTER_IP=$(echo "$IP_JSON" | jq -r '.[0]')
+        WORKER1_IP=$(echo "$IP_JSON" | jq -r '.[1]')
+        WORKER2_IP=$(echo "$IP_JSON" | jq -r '.[2]')
+        echo "MASTER_IP=$MASTER_IP" >> $GITHUB_ENV
+        echo "WORKER1_IP=$WORKER1_IP" >> $GITHUB_ENV
+        echo "WORKER2_IP=$WORKER2_IP" >> $GITHUB_ENV
+
+    - name: Add SSH Key to Agent
+      if: env.TF_ACTION == 'apply'
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.AZURE_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ env.MASTER_IP }} >> ~/.ssh/known_hosts
+        ssh-keyscan -H ${{ env.WORKER1_IP }} >> ~/.ssh/known_hosts
+        ssh-keyscan -H ${{ env.WORKER2_IP }} >> ~/.ssh/known_hosts
+
+    - name: Install K3s on Master
+      if: env.TF_ACTION == 'apply'
+      run: |
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./k3s-scripts/az-k3s-master.sh azureuser@${{ env.MASTER_IP }}:/tmp/k3s-master.sh
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null azureuser@${{ env.MASTER_IP }} "chmod +x /tmp/k3s-master.sh && sudo /tmp/k3s-master.sh"
+
+    - name: Fetch Node Token from Master
+      if: env.TF_ACTION == 'apply'
+      run: |
+        ssh azureuser@${{ env.MASTER_IP }} "sudo cat /var/lib/rancher/k3s/server/node-token" > node-token.txt
+        NODE_TOKEN=$(cat node-token.txt)
+        echo "NODE_TOKEN=$NODE_TOKEN" >> $GITHUB_ENV
+
+    - name: Install K3s on Worker 1
+      if: env.TF_ACTION == 'apply'
+      run: |
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./k3s-scripts/az-k3s-worker.sh azureuser@${{ env.WORKER1_IP }}:/tmp/k3s-worker.sh
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null azureuser@${{ env.WORKER1_IP }} "chmod +x /tmp/k3s-worker.sh && sudo /tmp/k3s-worker.sh ${{ env.MASTER_IP }} ${{ env.NODE_TOKEN }}"
+
+    - name: Install K3s on Worker 2
+      if: env.TF_ACTION == 'apply'
+      run: |
+        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ./k3s-scripts/az-k3s-worker.sh azureuser@${{ env.WORKER2_IP }}:/tmp/k3s-worker.sh
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null azureuser@${{ env.WORKER2_IP }} "chmod +x /tmp/k3s-worker.sh && sudo /tmp/k3s-worker.sh ${{ env.MASTER_IP }} ${{ env.NODE_TOKEN }}"
+
+    - name: Verify K3s Cluster
+      if: env.TF_ACTION == 'apply'
+      run: |
+        echo "[DEBUG] Checking node status..."
+        ssh azureuser@${{ env.MASTER_IP }} "kubectl get nodes -o wide"
+
+        sudo chmod 644 /etc/rancher/k3s/k3s.yaml
